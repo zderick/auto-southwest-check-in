@@ -4,7 +4,7 @@ import os
 import signal
 import time
 from datetime import datetime, timedelta
-from multiprocessing import Process
+from multiprocessing import Lock, Process
 from typing import TYPE_CHECKING
 
 from .flight import Flight
@@ -27,9 +27,10 @@ class CheckInHandler:
     Sleeps until the flight's check-in time and then attempts the check in.
     """
 
-    def __init__(self, checkin_scheduler: CheckInScheduler, flight: Flight) -> None:
+    def __init__(self, checkin_scheduler: CheckInScheduler, flight: Flight, lock: Lock) -> None:
         self.checkin_scheduler = checkin_scheduler
         self.flight = flight
+        self.lock = lock
         self.pid = None
 
         self.notification_handler = checkin_scheduler.notification_handler
@@ -49,24 +50,30 @@ class CheckInHandler:
         be pickled (necessary when using multiprocessing's 'spawn' start method).
         """
         logger.debug("Stopping check-in for current flight")
-        logger.debug(f"Killing process with PID {self.pid}")
-        os.kill(self.pid, signal.SIGTERM)
 
-        # Wait so zombie (defunct) processes are not created
-        logger.debug(f"Waiting for process with PID {self.pid} to be terminated")
         try:
+            logger.debug("Killing process with PID %d", self.pid)
+            os.kill(self.pid, signal.SIGTERM)
+
+            # Wait so zombie (defunct) processes are not created
+            logger.debug("Waiting for process with PID %d to be terminated", self.pid)
             os.waitpid(self.pid, 0)
-        except ChildProcessError:
-            # Processes are cleaned up without needing waitpid on Windows
+        except (ChildProcessError, PermissionError):
+            # Processes are handled differently in Windows
             pass
 
-        logger.debug(f"Process with PID {self.pid} successfully terminated")
+        logger.debug("Process with PID %d successfully terminated", self.pid)
 
     def _set_check_in(self) -> None:
         # Starts to check in five seconds early in case the Southwest server is ahead of your server
         checkin_time = self.flight.departure_time - timedelta(days=1, seconds=5)
-        self._wait_for_check_in(checkin_time)
-        self._check_in()
+
+        try:
+            self._wait_for_check_in(checkin_time)
+            self._check_in()
+        except KeyboardInterrupt:
+            # This is handled in the Reservation Monitor attached to this Checkin Handler
+            pass
 
     def _wait_for_check_in(self, checkin_time: datetime) -> None:
         current_time = datetime.utcnow()
@@ -74,21 +81,29 @@ class CheckInHandler:
             logger.debug("Check-in time has passed. Going straight to check-in")
             return
 
-        # Refresh headers 10 minutes before to make sure they are valid
-        sleep_time = (checkin_time - current_time - timedelta(minutes=10)).total_seconds()
+        # Refresh headers 30 minutes before to make sure they are valid
+        sleep_time = (checkin_time - current_time - timedelta(minutes=30)).total_seconds()
 
         # Only try to refresh the headers if the check-in is more than ten minutes away
         if sleep_time > 0:
-            logger.debug("Sleeping until ten minutes before check-in...")
-            self.safe_sleep(sleep_time)
-            self.checkin_scheduler.refresh_headers()
+            logger.debug("Sleeping until thirty minutes before check-in...")
+            self._safe_sleep(sleep_time)
+
+            # Lock to ensure multiple checkin handlers aren't refreshing headers
+            # at the same time (the webdriver doesn't work well with concurrency)
+            logger.debug("Acquiring lock...")
+            with self.lock:
+                logger.debug("Lock acquired")
+                self.checkin_scheduler.refresh_headers()
+
+            logger.debug("Lock released")
 
         current_time = datetime.utcnow()
         sleep_time = (checkin_time - current_time).total_seconds()
         logger.debug("Sleeping until check-in: %d seconds...", sleep_time)
         time.sleep(sleep_time)
 
-    def safe_sleep(self, total_sleep_time: int) -> None:
+    def _safe_sleep(self, total_sleep_time: int) -> None:
         """
         If the total sleep time is too long, an overflow error could occur.
         Therefore, the script will continuously sleep in two week periods

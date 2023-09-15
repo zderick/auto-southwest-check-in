@@ -2,6 +2,56 @@
 When upgrading to a new version, make sure to follow the directions under the "Upgrading" header of the corresponding version.
 If there is no "Upgrading" header for that version, no post-upgrade actions need to be performed.
 
+## 5.1 (2023-08-27)
+### Improvements
+- Ctrl-C is now handled better on Windows systems
+
+### Bug Fixes
+- Fix issues when checking flights for multiple accounts/reservations at the same time (such as 'Text file busy')
+([#138](https://github.com/jdholtz/auto-southwest-check-in/pull/138) by
+[@StevenMassaro](https://github.com/StevenMassaro))
+    - Since these checks are now run sequentially, it may take longer on the initial startup to get
+    notifications for all your check-ins. This does not affect the check-in process at all
+- Fix authentication issue for passwords with special characters
+([#140](https://github.com/jdholtz/auto-southwest-check-in/pull/140) by
+[@davidkassa](https://github.com/davidkassa))
+
+### Upgrading
+- Upgrade the dependencies to the latest versions by running `pip install -r requirements.txt`
+
+### Additional Notes
+- Same day flight check-ins currently don't work for the second flight. If you have a same-day flight
+(departing and return flights are within 24 hours of each other), see
+[my comment](https://github.com/jdholtz/auto-southwest-check-in/issues/135#issuecomment-1685040843) on issue #135
+to test a potential fix for this issue (and report back if it worked or not)
+
+## 5.0 (2023-08-04)
+
+### New Features
+- Account and reservation-specific configurations are now supported. See
+[Accounts and Reservations](CONFIGURATION.md#accounts-and-reservations) for more
+information
+([#124](https://github.com/jdholtz/auto-southwest-check-in/pull/124))
+- Pressing Ctrl-C now gives you information on cancelled check-ins instead of
+displaying a Traceback
+- An [FAQ](README.md#faq) section was added to the Readme. This is a place where
+commonly asked questions are answered. If you think additional questions should be added
+to this section, feel free to submit a Discussion or Pull Request with your proposal.
+
+### Improvements
+- Add a note about checking in a companion in the README. See
+[#126](https://github.com/jdholtz/auto-southwest-check-in/discussions/126) for more
+information
+
+### Bug Fixes
+- Fix incorrect price parsing when fares are not available for a flight
+([#122](https://github.com/jdholtz/auto-southwest-check-in/issues/122))
+
+### Upgrading
+- The 'flights' key in the configuration file was renamed to 'reservations'. See the
+[reservation configuration](CONFIGURATION.md#reservations) for more information.
+
+
 ## 4.3 (2023-07-13)
 
 ### Bug Fixes

@@ -1,10 +1,11 @@
+import multiprocessing
 import sys
 import time
 from datetime import datetime
 from typing import Any, Dict, List, Tuple
 
 from .checkin_scheduler import CheckInScheduler
-from .config import Config
+from .config import AccountConfig, Config
 from .fare_checker import FareChecker
 from .log import get_logger
 from .notification_handler import NotificationHandler
@@ -22,40 +23,61 @@ class ReservationMonitor:
     check-ins, flight changes or cancellations, and lower flight fares.
     """
 
-    def __init__(self, config: Config, first_name: str = None, last_name: str = None) -> None:
-        self.first_name = first_name
-        self.last_name = last_name
+    def __init__(self, config: Config, lock: multiprocessing.Lock = None) -> None:
+        self.first_name = config.first_name
+        self.last_name = config.last_name
 
         self.config = config
+        self.lock = lock
         self.notification_handler = NotificationHandler(self)
         self.checkin_scheduler = CheckInScheduler(self)
 
-    def monitor(self, reservations: List[Dict[str, Any]]) -> None:
+    def start(self) -> None:
+        """Start each reservation monitor in a separate process to run them in parallel"""
+        process = multiprocessing.Process(target=self.monitor)
+        process.start()
+
+    def monitor(self) -> None:
+        try:
+            self._monitor()
+        except KeyboardInterrupt:
+            # Add a small delay so the MainThread's message prints first
+            time.sleep(0.05)
+            # Lock so all processes are stopped sequentially
+            with self.lock:
+                self._stop_monitoring()
+
+    def _monitor(self) -> None:
         """
         Check for reservation changes and lower fares every X hours (retrieval interval).
         Will exit when no more flights are scheduled for check-in.
         """
+        reservation = {"confirmationNumber": self.config.confirmation_number}
+
         while True:
             time_before = datetime.utcnow()
 
-            # Ensure we have valid headers
-            self.checkin_scheduler.refresh_headers()
+            logger.debug("Acquiring lock...")
+            with self.lock:
+                logger.debug("Lock acquired")
 
-            # Schedule the reservations every time in case a flight is changed or cancelled
-            self._schedule_reservations(reservations)
+                # Ensure there are valid headers
+                self.checkin_scheduler.refresh_headers()
 
-            if len(self.checkin_scheduler.flights) <= 0:
-                logger.debug("No more flights are scheduled for check-in. Exiting...")
-                break
+                # Schedule the reservations every time in case a flight is changed or cancelled
+                self._schedule_reservations([reservation])
 
-            self._check_flight_fares()
+                if len(self.checkin_scheduler.flights) <= 0:
+                    logger.debug("No more flights are scheduled for check-in. Exiting...")
+                    break
 
-            if self.config.retrieval_interval <= 0:
-                logger.debug(
-                    "Monitoring reservations for lower fares is disabled as retrieval interval is 0"
-                )
-                break
+                self._check_flight_fares()
 
+                if self.config.retrieval_interval <= 0:
+                    logger.debug("Reservation monitoring is disabled as retrieval interval is 0")
+                    break
+
+            logger.debug("Lock released")
             self._smart_sleep(time_before)
 
     def _schedule_reservations(self, reservations: List[Dict[str, Any]]) -> None:
@@ -94,32 +116,55 @@ class ReservationMonitor:
         logger.debug("Sleeping for %d seconds", sleep_time)
         time.sleep(sleep_time)
 
+    def _stop_checkins(self) -> None:
+        """
+        Stops all check-ins for a monitor. This is called when Ctrl-C is pressed. The
+        flight information is not logged because it contains sensitive information.
+        """
+        for checkin in self.checkin_scheduler.checkin_handlers:
+            print(
+                f"Cancelling check-in from '{checkin.flight.departure_airport}' to "
+                f"'{checkin.flight.destination_airport}' for {self.first_name} {self.last_name}"
+            )
+            checkin.stop_check_in()
+
+    def _stop_monitoring(self) -> None:
+        print(
+            f"\nStopping monitoring for reservation with confirmation number "
+            f"{self.config.confirmation_number} and name {self.first_name} {self.last_name}"
+        )
+        self._stop_checkins()
+
 
 class AccountMonitor(ReservationMonitor):
     """Monitor an account for newly booked reservations"""
 
-    def __init__(self, config: Config, username: str, password: str) -> None:
-        self.username = username
-        self.password = password
-        super().__init__(config)
+    def __init__(self, config: AccountConfig, lock: multiprocessing.Lock) -> None:
+        super().__init__(config, lock)
+        self.username = config.username
+        self.password = config.password
 
-    def monitor(self) -> None:
+    def _monitor(self) -> None:
         """
-        Check for newly booked reservations for the account every
-        X hours (retrieval interval).
+        Check for newly booked reservations for the account every X hours (retrieval interval).
         """
         while True:
             time_before = datetime.utcnow()
-            reservations, skip_scheduling = self._get_reservations()
 
-            if not skip_scheduling:
-                self._schedule_reservations(reservations)
-                self._check_flight_fares()
+            logger.debug("Acquiring lock...")
+            with self.lock:
+                logger.debug("Lock acquired")
+                reservations, skip_scheduling = self._get_reservations()
 
-            if self.config.retrieval_interval <= 0:
-                logger.debug("Account monitoring is disabled as retrieval interval is 0")
-                break
+                if not skip_scheduling:
+                    self._schedule_reservations(reservations)
+                    self._check_flight_fares()
 
+                if self.config.retrieval_interval <= 0:
+                    logger.debug("Account monitoring is disabled as retrieval interval is 0")
+                    break
+
+            logger.debug("Lock released")
             self._smart_sleep(time_before)
 
     def _get_reservations(self) -> Tuple[List[Dict[str, Any]], bool]:
@@ -151,3 +196,7 @@ class AccountMonitor(ReservationMonitor):
 
         logger.debug("Successfully retrieved %d reservations", len(reservations))
         return reservations, False
+
+    def _stop_monitoring(self) -> None:
+        print(f"\nStopping monitoring for account with username {self.username}")
+        self._stop_checkins()

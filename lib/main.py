@@ -2,16 +2,16 @@
 
 from __future__ import annotations
 
+import multiprocessing
 import sys
-from multiprocessing import Process
 from typing import TYPE_CHECKING, List
 
 from lib import log
 
 if TYPE_CHECKING:
-    from lib.config import Config
+    from lib.config import GlobalConfig
 
-__version__ = "v4.3"
+__version__ = "v5.1"
 
 __doc__ = """
 Schedule a check-in:
@@ -52,31 +52,56 @@ def check_flags(arguments: List[str]) -> None:
         sys.exit()
 
 
-def set_up_accounts(config: Config) -> None:
+def get_notification_urls(config: GlobalConfig) -> List[str]:
+    """
+    Get all notification URLS in the global config, each account, and each
+    reservation. Removes duplicates so notifications are not sent twice to
+    the same source.
+    """
+    notification_urls = config.notification_urls
+
+    for account in config.accounts:
+        notification_urls.extend(account.notification_urls)
+
+    for reservation in config.reservations:
+        notification_urls.extend(reservation.notification_urls)
+
+    # Remove duplicates
+    notification_urls = list(set(notification_urls))
+    return notification_urls
+
+
+def test_notifications(config: GlobalConfig) -> None:
+    notification_urls = get_notification_urls(config)
+
+    # pylint:disable=import-outside-toplevel
+    from .config import ReservationConfig
+    from .reservation_monitor import ReservationMonitor
+
+    new_config = ReservationConfig()
+    new_config.notification_urls = notification_urls
+    reservation_monitor = ReservationMonitor(new_config)
+
+    logger.info("Sending test notifications to %d sources", len(notification_urls))
+    reservation_monitor.notification_handler.send_notification("This is a test message")
+
+
+def set_up_accounts(config: GlobalConfig, lock: multiprocessing.Lock) -> None:
     # pylint:disable=import-outside-toplevel
     from .reservation_monitor import AccountMonitor
 
     for account in config.accounts:
-        account_monitor = AccountMonitor(config, account[0], account[1])
-
-        # Start each account monitor in a separate process to run them in parallel
-        process = Process(target=account_monitor.monitor)
-        process.start()
+        account_monitor = AccountMonitor(account, lock)
+        account_monitor.start()
 
 
-def set_up_reservations(config: Config) -> None:
+def set_up_reservations(config: GlobalConfig, lock: multiprocessing.Lock) -> None:
     # pylint:disable=import-outside-toplevel
     from .reservation_monitor import ReservationMonitor
 
     for reservation in config.reservations:
-        reservation_monitor = ReservationMonitor(config, reservation[1], reservation[2])
-
-        # Start each reservation monitor in a separate process to run them in parallel
-        process = Process(
-            target=reservation_monitor.monitor,
-            args=([{"confirmationNumber": reservation[0]}],),
-        )
-        process.start()
+        reservation_monitor = ReservationMonitor(reservation, lock)
+        reservation_monitor.start()
 
 
 def set_up_check_in(arguments: List[str]) -> None:
@@ -84,27 +109,31 @@ def set_up_check_in(arguments: List[str]) -> None:
     Initialize reservation and account monitoring based on the configuration
     and arguments passed in
     """
+    logger.debug("Auto-Southwest Check-In %s", __version__)
     logger.debug("Called with %d arguments", len(arguments))
 
     # Imported here to avoid needing dependencies to retrieve the script's
     # version or usage
     # pylint:disable=import-outside-toplevel
-    from .config import Config
-    from .reservation_monitor import ReservationMonitor
+    from .config import GlobalConfig
 
-    config = Config()
+    config = GlobalConfig()
+    config.initialize()
 
     if "--test-notifications" in arguments:
-        reservation_monitor = ReservationMonitor(config)
-
-        logger.info("Sending test notifications...")
-        reservation_monitor.notification_handler.send_notification("This is a test message")
+        test_notifications(config)
         sys.exit()
     elif len(arguments) == 2:
-        config.accounts.append([arguments[0], arguments[1]])
+        account = {"username": arguments[0], "password": arguments[1]}
+        config.create_account_config([account])
         logger.debug("Account added through CLI arguments")
     elif len(arguments) == 3:
-        config.reservations.append([arguments[0], arguments[1], arguments[2]])
+        reservation = {
+            "confirmationNumber": arguments[0],
+            "firstName": arguments[1],
+            "lastName": arguments[2],
+        }
+        config.create_reservation_config([reservation])
         logger.debug("Reservation added through CLI arguments")
     elif len(arguments) > 3:
         logger.error("Invalid arguments. For more information, try '--help'")
@@ -113,8 +142,14 @@ def set_up_check_in(arguments: List[str]) -> None:
     logger.debug(
         "Monitoring %d accounts and %d reservations", len(config.accounts), len(config.reservations)
     )
-    set_up_accounts(config)
-    set_up_reservations(config)
+    lock = multiprocessing.Lock()
+    set_up_accounts(config, lock)
+    set_up_reservations(config, lock)
+
+    # Keep the main process alive until all processes are done so it can handle
+    # keyboard interrupts
+    for process in multiprocessing.active_children():
+        process.join()
 
 
 def main(arguments: List[str]) -> None:
@@ -125,4 +160,9 @@ def main(arguments: List[str]) -> None:
 
     # Remove flags now that they are not needed (and will mess up parsing)
     arguments = [x for x in arguments if x not in flags_to_remove]
-    set_up_check_in(arguments)
+
+    try:
+        set_up_check_in(arguments)
+    except KeyboardInterrupt:
+        logger.info("\nCtrl+C pressed. Stopping all check-ins")
+        sys.exit(130)
